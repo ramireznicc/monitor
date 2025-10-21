@@ -1,32 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Change directory to the project root
 cd "$(dirname "$0")"
-
 PY="${PYTHON:-python3}"
 
-# Create virtual environment if it doesn't exist
-if [ ! -d .venv ]; then
-  echo "[setup] Creating virtual environment..."
-  "$PY" -m venv .venv
-  . .venv/bin/activate
-  python -m pip install -U pip wheel
-  # Install dependencies if requirements.txt exists
-  if [ -f requirements.txt ]; then
-    pip install -r requirements.txt
-  fi
-else
-  . .venv/bin/activate
+[ -d .venv ] || { echo "[setup] Creating virtual environment..."; "$PY" -m venv .venv >/dev/null 2>&1; }
+# shellcheck disable=SC1091
+. .venv/bin/activate
+
+python -m pip install -U pip wheel -q >/dev/null 2>&1 || true
+if [ -f requirements.txt ]; then
+  python -m pip install -r requirements.txt -q >/dev/null 2>&1 || {
+    echo "[setup] Dependency install failed. Showing logs..."
+    python -m pip install -r requirements.txt
+    exit 1
+  }
 fi
 
-# Visual startup message
 echo ""
 echo "🖥️  System Monitor started"
 echo "-----------------------------------------"
-echo "Press [Ctrl + C] to pause monitoring"
+echo "Press [Ctrl + C] to stop monitoring"
 echo "-----------------------------------------"
 echo ""
 
-# Run the monitor
-python src/monitor_basic.py
+python main.py
