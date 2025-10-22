@@ -1,10 +1,6 @@
-
 # System Monitor (with optional Telegram alerts)
 
 A lightweight Python system monitor for Linux that collects CPU, RAM, Disk, and basic Network stats and automatically sends Telegram notifications every 180 seconds. Runs locally with a small footprint, logs to console/file, and works with a simple .env configuration.
-
-
-
 
 ## Requirements
 
@@ -12,9 +8,10 @@ A lightweight Python system monitor for Linux that collects CPU, RAM, Disk, and 
 - Python 3.10+, pip, venv
 - Internet (only for Telegram)
 - Telegram bot token + chat ID (optional)
+
 ## Quick Start
 
-``` bash
+```bash
 # Clone and enter the project
 git clone https://github.com/<your-username>/system-monitor.git
 cd system-monitor
@@ -31,4 +28,3 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env and set your values (optional for Telegram)
 ```
-
