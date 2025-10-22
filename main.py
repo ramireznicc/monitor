@@ -1,96 +1,149 @@
 # main.py
-import time
 import logging
-import signal
-import sys
-from typing import Dict
+import threading
+import time
+import socket
+import platform
+import datetime
+from logging.handlers import RotatingFileHandler
 
+import psutil
+
+from system_monitor.notifier import notify, format_startup, format_shutdown, format_system_status
 from system_monitor.config import (
     LOG_FILE,
     LOG_LEVEL,
     INTERVAL_SECONDS,
-    CPU_THRESHOLD,
-    MEM_THRESHOLD,
-    DISK_THRESHOLD,
-    ALERT_COOLDOWN_SECONDS,
-    TELEGRAM_ENABLED,
+    STARTUP_NOTIFY_ENABLED,
+    SHUTDOWN_NOTIFY_ENABLED,
 )
-from system_monitor.utils import setup_logging
-from system_monitor.system_checker import snapshot
-from system_monitor.notifier import notify, format_alert
 
-RUNNING = True
-_last_alert_ts: Dict[str, float] = {}
+# Send System Status to Telegram every 3 minutes
+STATUS_PUSH_INTERVAL_SECONDS = 180  # TODO: make configurable via .env later
 
 
-def handle_signal(signum, frame):
+def setup_file_logging() -> None:
     """
-    Signal handler to stop the monitoring loop gracefully without extra logs.
+    Configure logging to write only to a rotating file defined by config.LOG_FILE.
+    No console output.
     """
-    global RUNNING
-    RUNNING = False
+    logger = logging.getLogger()
+    logger.setLevel(LOG_LEVEL)
+
+    # Remove any existing handlers (console, etc.)
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    # Rotating file handler (5 MB max, keep 3 backups)
+    file_handler = RotatingFileHandler(
+        str(LOG_FILE),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
 
-def _should_alert(metric: str, now: float) -> bool:
+def _uptime_str() -> str:
+    boot = datetime.datetime.fromtimestamp(psutil.boot_time())
+    delta = datetime.datetime.now() - boot
+    days = delta.days
+    hours, rem = divmod(delta.seconds, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    return " ".join(parts) or "0m"
+
+
+def startup_sequence():
+    if STARTUP_NOTIFY_ENABLED:
+        hostname = socket.gethostname()
+        os_pretty = f"{platform.system()} {platform.release()}"
+        uptime = _uptime_str()
+        # Interval displayed for logging info only
+        notify(format_startup(hostname, os_pretty, uptime, INTERVAL_SECONDS))
+
+    # Immediately send first System Status after startup
+    notify(format_system_status())
+
+
+def logging_worker(stop_event: threading.Event):
     """
-    Decide if we can send an alert for a given metric based on cooldown.
+    Keeps logging system metrics every INTERVAL_SECONDS.
+    This does not send Telegram messages, only logs to file.
     """
-    last = _last_alert_ts.get(metric, 0.0)
-    if now - last >= ALERT_COOLDOWN_SECONDS:
-        _last_alert_ts[metric] = now
-        return True
-    return False
+    while not stop_event.is_set():
+        try:
+            cpu = psutil.cpu_percent(interval=0.0)
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage("/")
+            logging.info(
+                "System metrics | CPU: %.1f%% | RAM: %.1f%% | Disk: %.1f%%",
+                cpu, mem.percent, disk.percent
+            )
+        except Exception as exc:
+            logging.exception(f"Metrics logging error: {exc}")
+
+        for _ in range(INTERVAL_SECONDS):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+
+def telegram_status_worker(stop_event: threading.Event):
+    """
+    Sends System Status to Telegram every STATUS_PUSH_INTERVAL_SECONDS.
+    """
+    # Already sent one at startup
+    while not stop_event.is_set():
+        for _ in range(STATUS_PUSH_INTERVAL_SECONDS):
+            if stop_event.is_set():
+                return
+            time.sleep(1)
+
+        try:
+            notify(format_system_status())
+        except Exception as exc:
+            logging.exception(f"Telegram status push error: {exc}")
 
 
 def main():
-    """
-    Entry point for the System Monitor.
-    - Sets up file-based logging.
-    - Registers signal handlers for graceful shutdown.
-    - Periodically logs system metrics (CPU, Memory, Disk).
-    - Emits alerts (log WARNING and optional Telegram) when thresholds are exceeded,
-      with a per-metric cooldown to prevent spam.
-    """
-    setup_logging(LOG_FILE, LOG_LEVEL)
-    logging.info("System Monitor started")
+    setup_file_logging()  # logs only go to file (no console printing)
 
-    # Register signal handlers for a clean shutdown (Ctrl+C, SIGTERM)
-    signal.signal(signal.SIGINT, handle_signal)   # Ctrl+C
-    signal.signal(signal.SIGTERM, handle_signal)  # Service stop/kill
+    stop_event = threading.Event()
 
     try:
-        while RUNNING:
-            cpu, mem, disk = snapshot()
-            logging.info(f"CPU={cpu}% MEM={mem}% DISK={disk}%")
+        startup_sequence()
 
-            now = time.time()
+        t_log = threading.Thread(target=logging_worker, args=(stop_event,), daemon=True)
+        t_push = threading.Thread(target=telegram_status_worker, args=(stop_event,), daemon=True)
 
-            if cpu > CPU_THRESHOLD and _should_alert("CPU", now):
-                msg = f"CPU high: {cpu:.1f}% (threshold {CPU_THRESHOLD:.1f}%)"
-                logging.warning(msg)
-                if TELEGRAM_ENABLED:
-                    notify(format_alert("CPU", cpu, CPU_THRESHOLD))
+        t_log.start()
+        t_push.start()
 
-            if mem > MEM_THRESHOLD and _should_alert("MEM", now):
-                msg = f"Memory high: {mem:.1f}% (threshold {MEM_THRESHOLD:.1f}%)"
-                logging.warning(msg)
-                if TELEGRAM_ENABLED:
-                    notify(format_alert("Memory", mem, MEM_THRESHOLD))
+        # Keep main thread alive
+        while True:
+            time.sleep(1)
 
-            if disk > DISK_THRESHOLD and _should_alert("DISK", now):
-                msg = f"Disk usage high: {disk:.1f}% (threshold {DISK_THRESHOLD:.1f}%)"
-                logging.warning(msg)
-                if TELEGRAM_ENABLED:
-                    notify(format_alert("Disk", disk, DISK_THRESHOLD))
-
-            time.sleep(INTERVAL_SECONDS)
-    except Exception as e:
-        # Log unexpected exceptions and exit with non-zero status
-        logging.exception(f"Unexpected error: {e}")
-        sys.exit(1)
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user, shutting down...")
     finally:
-        logging.info("System Monitor stopped")
-        logging.info("")
+        stop_event.set()
+        time.sleep(0.5)
+        # Shutdown notification safely handled
+        try:
+            if SHUTDOWN_NOTIFY_ENABLED:
+                hostname = socket.gethostname()
+                notify(format_shutdown(hostname))
+        except Exception as exc:
+            logging.exception(f"Shutdown notification failed: {exc}")
 
 
 if __name__ == "__main__":
